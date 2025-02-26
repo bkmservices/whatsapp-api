@@ -2,88 +2,106 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const http = require("http");
 const socketIO = require("socket.io");
-const { makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
+const { Client, LocalAuth } = require("whatsapp-web.js");
 const { body, validationResult } = require("express-validator");
 const qrcode = require("qrcode");
 const pino = require("pino");
 const fs = require("fs");
-const con = require("./core/core.js");
+const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIO(server);
 const port = 9000;
-const path = "sessions/";
+const sessionPath = "sessions/";
 
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 io.on("connection", (socket) => {
     socket.on("StartConnection", async (device) => {
-        const sessionPath = path.concat(device);
-
-        if (fs.existsSync(sessionPath)) {
+        const deviceSessionPath = path.join(sessionPath, device);
+        
+        // Vérifier si la session existe
+        if (fs.existsSync(deviceSessionPath)) {
             socket.emit("message", "WhatsApp connected");
             socket.emit("ready", device);
         } else {
-            const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-
-            const sock = makeWASocket({
-                printQRInTerminal: false,
-                auth: state,
+            const client = new Client({
+                authStrategy: new LocalAuth({ clientId: device }), // Utilisation de l'auth local
                 logger: pino({ level: "fatal" }),
-                browser: ["theazran_", "EDGE", "1.0"],
+                puppeteer: { headless: true },
             });
 
-            sock.ev.on("connection.update", (update) => {
-                const { connection, qr } = update;
-
-                if (qr) {
-                    qrcode.toDataURL(qr, (err, url) => {
-                        socket.emit("qr", url);
-                        socket.emit("message", "QR Code received, scan please!");
-                    });
-                }
-
-                if (connection === "close") {
-                    con.gas(null, device);
-                    socket.emit("message", "WhatsApp connected");
-                    socket.emit("ready", device);
-                }
+            client.on("qr", (qr) => {
+                // Générer le QR Code et l'envoyer au client
+                qrcode.toDataURL(qr, (err, url) => {
+                    socket.emit("qr", url);
+                    socket.emit("message", "QR Code received, scan please!");
+                });
             });
 
-            sock.ev.on("creds.update", saveCreds);
+            client.on("authenticated", () => {
+                socket.emit("message", "WhatsApp authenticated");
+                socket.emit("ready", device);
+            });
+
+            client.on("ready", () => {
+                socket.emit("message", "WhatsApp is ready");
+            });
+
+            client.on("disconnected", (reason) => {
+                socket.emit("message", `Disconnected: ${reason}`);
+            });
+
+            client.initialize();
         }
     });
 
     socket.on("LogoutDevice", (device) => {
-        const sessionPath = path.concat(device);
+        const deviceSessionPath = path.join(sessionPath, device);
 
-        if (fs.existsSync(sessionPath)) {
-            fs.rmdirSync(sessionPath, { recursive: true });
+        if (fs.existsSync(deviceSessionPath)) {
+            fs.rmdirSync(deviceSessionPath, { recursive: true });
             console.log("Logout device: " + device);
             socket.emit("message", "Logout device: " + device);
         }
     });
 });
 
+// Route principale
 app.get("/", (req, res) => {
-    res.sendFile(__dirname + "/core/device.html");
+    res.sendFile(path.join(__dirname, "/core/device.html"));
 });
 
+// Route pour afficher le QR
 app.get("/scan/:id", (req, res) => {
-    res.sendFile(__dirname + "/core/index.html");
+    res.sendFile(path.join(__dirname, "/core/index.html"));
 });
 
+// Route pour envoyer des messages via query params
 app.get("/send", (req, res) => {
     const { number, to, type, message, img } = req.query;
-    const sessionPath = path.concat(number); // Assuming 'path' is defined elsewhere
+    const deviceSessionPath = path.join(sessionPath, number); 
 
-    if (fs.existsSync(sessionPath)) {
+    if (fs.existsSync(deviceSessionPath)) {
         try {
-            // Assuming 'con.gas' is a function defined elsewhere
-            con.gas(message, number, to, type, img);
-            res.status(200).json({ status: true, message: "success" });
+            // Exécution de l'envoi de message via WhatsApp Web.js (ajoute ta logique ici)
+            const client = new Client({
+                authStrategy: new LocalAuth({ clientId: number }), // Chargement de la session
+            });
+
+            client.on("ready", () => {
+                const chat = await client.getChatById(to);
+                if (type === "text") {
+                    chat.sendMessage(message);
+                } else if (type === "image") {
+                    chat.sendImage(img, message);
+                }
+                res.status(200).json({ status: true, message: "success" });
+            });
+
+            client.initialize();
         } catch (error) {
             res.status(401).json({ status: false, message: error.message });
         }
@@ -95,7 +113,7 @@ app.get("/send", (req, res) => {
     }
 });
 
-
+// Route pour envoyer des messages via POST (avec validation)
 app.post(
     "/send",
     [
@@ -115,14 +133,28 @@ app.post(
         }
 
         const { number, to, type, message } = req.body;
-        const sessionPath = path.concat(number);
+        const deviceSessionPath = path.join(sessionPath, number);
 
-        if (fs.existsSync(sessionPath)) {
+        if (fs.existsSync(deviceSessionPath)) {
             try {
-                con.gas(message, number, to, type);
-                res.status(200).json({ status: true, message: "success" });
+                // Exécution de l'envoi de message via WhatsApp Web.js
+                const client = new Client({
+                    authStrategy: new LocalAuth({ clientId: number }), // Chargement de la session
+                });
+
+                client.on("ready", async () => {
+                    const chat = await client.getChatById(to);
+                    if (type === "text") {
+                        await chat.sendMessage(message);
+                    } else if (type === "image") {
+                        await chat.sendImage(message);
+                    }
+                    res.status(200).json({ status: true, message: "success" });
+                });
+
+                client.initialize();
             } catch (error) {
-                res.status(401).json({ status: false, message: error });
+                res.status(401).json({ status: false, message: error.message });
             }
         } else {
             res.status(401).json({
@@ -133,11 +165,13 @@ app.post(
     }
 );
 
+// Route pour le device
 app.post("/device", (req, res) => {
     const deviceNumber = req.body.device;
     res.redirect("/scan/" + deviceNumber);
 });
 
+// Lancer le serveur
 server.listen(port, () => {
     console.log("App running on: " + port);
 });
