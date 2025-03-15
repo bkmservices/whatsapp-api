@@ -1,40 +1,75 @@
-// server.js
-const express = require('express');
-const startBot = require('./bot');
-const app = express();
+const { Boom } = require('@hapi/boom')
+const NodeCache = require('@cacheable/node-cache')
+const readline = require('readline')
+const makeWASocket = require('../src')
+const P = require('pino')
 
-// Utiliser un port par défaut ou un port configuré par Render
-const port = process.env.PORT || 3000;
+const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./wa-logs.txt'))
+logger.level = 'trace'
 
-// Middleware pour parser le corps des requêtes en JSON
-app.use(express.json());
+const usePairingCode = process.argv.includes('--use-pairing-code')
 
-// Démarrer le bot WhatsApp
-let sock;
-startBot().then((s) => {
-    sock = s;
-    console.log('Bot démarré et connecté à WhatsApp');
-});
+// Read line interface
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+const question = (text) => new Promise((resolve) => rl.question(text, resolve))
 
-// Route pour envoyer un message via WhatsApp
-app.post('/send-message', async (req, res) => {
-    const { phoneNumber, message } = req.body;
+// start a connection
+const startSock = async () => {
+  const { state, saveCreds } = await makeWASocket.useMultiFileAuthState('baileys_auth_info')
+  // fetch latest version of WA Web
+  const { version, isLatest } = await makeWASocket.fetchLatestBaileysVersion()
+  console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
 
-    if (!phoneNumber || !message) {
-        return res.status(400).send({ error: 'Numéro de téléphone et message requis.' });
+  const sock = makeWASocket({
+    version,
+    logger,
+    printQRInTerminal: !usePairingCode,
+    auth: {
+      creds: state.creds,
+      keys: state.keys,
+    },
+    msgRetryCounterCache: new NodeCache(),
+    generateHighQualityLinkPreview: true,
+    getMessage,
+  })
+
+  // Pairing code for Web clients
+  if (usePairingCode && !sock.authState.creds.registered) {
+    const phoneNumber = await question('Please enter your phone number:\n')
+    const code = await sock.requestPairingCode(phoneNumber)
+    console.log(`Pairing code: ${code}`)
+  }
+
+  sock.ev.process(async (events) => {
+    if (events['connection.update']) {
+      const update = events['connection.update']
+      const { connection, lastDisconnect } = update
+      if (connection === 'close') {
+        if ((lastDisconnect?.error)?.output?.statusCode !== makeWASocket.DisconnectReason.loggedOut) {
+          startSock() // reconnect if not logged out
+        } else {
+          console.log('Connection closed. You are logged out.')
+        }
+      }
+      console.log('connection update', update)
     }
 
-    try {
-        const jid = `${phoneNumber}@s.whatsapp.net`; // Format du JID (identifiant WhatsApp)
-        await sock.sendMessage(jid, { text: message });
-        res.status(200).send({ success: 'Message envoyé avec succès.' });
-    } catch (error) {
-        console.error('Erreur d\'envoi du message:', error);
-        res.status(500).send({ error: 'Erreur lors de l\'envoi du message.' });
+    if (events['creds.update']) {
+      await saveCreds()
     }
-});
 
-// Démarrer le serveur
-app.listen(port, () => {
-    console.log(`API WhatsApp disponible sur http://localhost:${port}`);
-});
+    if (events['messages.upsert']) {
+      const upsert = events['messages.upsert']
+      console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
+      // Add logic here for replying, processing incoming messages
+    }
+  })
+
+  return sock
+
+  async function getMessage(key) {
+    return undefined // Implement a way to retrieve messages if necessary
+  }
+}
+
+startSock()
