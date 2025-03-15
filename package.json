@@ -4,7 +4,7 @@
   "description": "API WhatsApp avec Baileys",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.0.0",
